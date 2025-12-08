@@ -1,124 +1,131 @@
 # H-Anchor: Hierarchical Anchor-Based Placement Algorithm
 
-A novel placement algorithm inspired by **HNSW (Hierarchical Navigable Small World)** graphs. Unlike traditional multilevel placement which clusters nodes into super-nodes, H-Anchor maintains individual cell identities but filters them by "importance" or "topological centrality" to create placement layers.
+A high-performance placement algorithm inspired by **HNSW (Hierarchical Navigable Small World)** graphs. Features a **C++ core with OpenMP parallelization** achieving ~38x speedup over pure Python.
 
-## 🎯 Core Concept
+## 🚀 Performance
 
-```
-Layer L_top:  ●───────────────●───────────────●  (Global Anchors - Highest Centrality)
-                   ╲         ╱ ╲         ╱
-Layer L_mid:  ●─────●───────●───●───────●─────●  (Local Anchors - Bridge Gaps)  
-                ╲ ╱   ╲   ╱       ╲   ╱   ╲ ╱
-Layer L_0:    ●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●  (All Cells)
-```
+| Version | Speed | Throughput |
+|---------|-------|------------|
+| Pure Python | 42s | 79 cells/sec |
+| C++ (single-thread) | 3.0s | 1,084 cells/sec |
+| **C++ (multi-core)** | **1.1s** | **2,907 cells/sec** |
 
-### HNSW Analogy
+✅ **Deterministic**: Multiple runs produce identical results
 
-| HNSW | H-Anchor |
-|------|----------|
-| Top layers: few nodes, long links | Top layer: Global Anchors (high centrality) |
-| Bottom layers: all nodes, local precision | Bottom layer: All cells in netlist |
-| Navigate: "Which node is closest?" | Place: "Where should main blocks go?" |
-| Descend for precision | Descend to place local logic between anchors |
-
-## 🚀 Quick Start
+## 🎯 Quick Start
 
 ```bash
 # Install dependencies
 pip install -r requirements.txt
 
-# Run example
-python example.py clustered --viz
+# Build C++ extension (requires pybind11)
+pip install pybind11
+python setup.py build_ext --inplace
+
+# For OpenMP support on macOS:
+brew install libomp
+
+# Run synthetic benchmark (no external data needed!)
+python run_real_benchmark.py large_cpu
 ```
+
+### Output
+- `output/large_cpu_hierarchy.png` - Layer structure visualization
+- `output/large_cpu_placement.png` - Final placement
+- `output/large_cpu_modules.png` - Module clustering view
+- `output/large_cpu_detailed.png` - Detailed layer view
 
 ## 📁 Project Structure
 
 ```
-hap/
-├── h_anchor.py        # Core algorithm implementation
-├── visualization.py   # Placement visualization tools
-├── benchmarks.py      # Synthetic benchmark generators
-├── example.py         # Usage examples and demos
-└── requirements.txt   # Python dependencies
+PycPlacer/
+├── src/
+│   ├── h_anchor_core.hpp    # C++ header
+│   ├── h_anchor_core.cpp    # C++ implementation (OpenMP parallelized)
+│   └── bindings.cpp         # pybind11 Python bindings
+├── h_anchor_fast.py         # Python wrapper for C++ backend
+├── visualization.py         # Placement visualization tools
+├── benchmarks.py            # Synthetic benchmark generators
+├── run_real_benchmark.py    # Main runner script
+├── setup.py                 # Build configuration
+└── requirements.txt         # Python dependencies
 ```
 
-## 🔧 Algorithm Phases
+## 🔧 Algorithm Overview
 
-### Phase 1: Hierarchy Construction (Bottom-Up)
+```
+Layer L_top:  ●───────────────●───────────────●  (Global Anchors)
+                   ╲         ╱ ╲         ╱
+Layer L_mid:  ●─────●───────●───●───────●─────●  (Local Anchors)  
+                ╲ ╱   ╲   ╱       ╲   ╱   ╲ ╱
+Layer L_0:    ●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●  (All Cells)
+```
 
-Builds placement layers using **spatial inhibition** to ensure anchors are well-distributed:
+### Phases
+1. **Hierarchy Construction**: Score-based selection with spatial inhibition
+2. **Top-Down Placement**: Force-directed with variable node masses
+3. **Legalization**: Tetris-style row assignment
+
+## ⚙️ Configuration
 
 ```python
-from h_anchor import HAnchorPlacer, PlacementConfig
+from h_anchor_fast import HAnchorPlacer, PlacementConfig
 
 config = PlacementConfig(
+    # Hierarchy
     num_layers=5,
     top_layer_size=100,
-    scoring_method=ScoringMethod.HYBRID,  # PageRank + Degree
-    decimation_factor=0.25,  # Each layer is ~25% of previous
+    decimation_factor=0.25,
+    
+    # Force-directed
+    repulsion_strength=2.0,
+    attraction_strength=0.1,
+    overlap_repulsion=5.0,    # Prevent cell overlap
+    min_spacing=8.0,          # Minimum cell distance
+    
+    # Layout control
+    spread_factor=0.6,        # Initial distribution range (0-1)
+    global_attraction=0.02,   # Pull clusters together
+    center_gravity=0.01,      # Center pull
+    
+    # Die area
+    die_width=1000.0,
+    die_height=1000.0,
 )
 
 placer = HAnchorPlacer(config)
 placer.load_netlist(graph, cells)
-placer.construct_hierarchy()
-```
+placer.run()
 
-**Score Calculation:**
-```
-S(v) = α · Degree(v) + β · PageRank(v)
-```
-
-**Layer Assignment (Iterative Decimation):**
-1. Sort cells by score
-2. Select highest-scoring cell
-3. Mark its neighbors as "covered" (spatial inhibition)
-4. Select next highest unsuppressed cell
-5. Repeat until target count reached
-
-### Phase 2: Top-Down Placement (The "Descent")
-
-#### Step A: Top-Level Placement
-```python
-placer.place_top_layer()  # Force-directed on global anchors
-```
-
-Uses **transitive closure edges** to handle disconnected anchor subgraphs:
-- If Anchor A connects to Anchor B via 3 unplaced cells
-- Add virtual edge with weight 1/3
-
-#### Step B: Recursive Descent
-```python
-placer.descend_and_refine()
-```
-
-For each layer:
-1. **Initial Projection:** Place new nodes at weighted center of placed neighbors
-   ```
-   Pos(u) = Σ Pos(v) · Weight(u,v) / Σ Weight(u,v)
-   ```
-2. **Add Jitter:** Prevent collapse when many cells project to same point
-3. **Refinement:** Force-directed optimization with variable masses
-   - Anchors have high mass (move less)
-   - New cells have low mass (move freely)
-
-### Phase 3: Legalization
-```python
-placer.legalize()  # Tetris-style legalization
+print(f"HPWL: {placer.compute_wirelength()}")
 ```
 
 ## 📊 Benchmarks
 
+### Synthetic (included, no external data needed)
 | Benchmark | Description |
 |-----------|-------------|
+| `large_cpu` | 3,300 cells, 10 modules (ALU, RegFile, etc.) |
 | `random` | Erdős–Rényi random graph |
-| `clustered` | Hierarchical blocks with sparse inter-connections |
-| `mesh` | 2D grid topology (NoC, systolic arrays) |
-| `datapath` | Pipelined datapath with feedback |
-| `heterogeneous` | FPGA-like (RAMs, DSPs, IOs as natural anchors) |
-| `smallworld` | Watts-Strogatz small-world network |
+| `clustered` | Hierarchical blocks |
+| `mesh` | 2D grid topology |
 
 ```bash
-python example.py heterogeneous --viz
+python run_real_benchmark.py large_cpu
+```
+
+### Real Benchmarks (optional)
+
+To run ISCAS89, MCNC, and other real benchmarks, download the benchmark data:
+
+```bash
+# Create benchmarks_data directory and download BLIF files
+mkdir -p benchmarks_data/iscas89
+# Download from: https://github.com/cuhk-eda/benchmarks
+# or: https://cadlab.cs.ucla.edu/~pubbench/
+
+# Then run:
+python run_real_benchmark.py iscas89/s38417
 ```
 
 ## 🎨 Visualization
@@ -127,88 +134,20 @@ python example.py heterogeneous --viz
 from visualization import PlacementVisualizer
 
 viz = PlacementVisualizer(placer)
-viz.plot_hierarchy_layers()      # Show layer structure
-viz.plot_placement_progression() # Show descent through layers
-viz.plot_placement()             # Final placement
+viz.plot_hierarchy_layers()       # Layer structure
+viz.plot_placement()              # Final placement
+viz.plot_module_view()            # Module clustering
+viz.plot_detailed_zoom()          # Detailed view
 viz.plot_wirelength_distribution()
 ```
 
-## ⚙️ Configuration
+## 🔑 Key Features
 
-```python
-PlacementConfig(
-    # Hierarchy
-    num_layers=5,              # Number of hierarchy levels
-    top_layer_size=100,        # Target size for top layer
-    decimation_factor=0.25,    # Layer size reduction factor
-    
-    # Scoring
-    scoring_method=ScoringMethod.HYBRID,
-    alpha=0.4,                 # Degree weight
-    beta=0.6,                  # PageRank weight
-    
-    # Force-directed
-    top_layer_iterations=200,
-    refinement_iterations=50,
-    repulsion_strength=1.0,
-    attraction_strength=0.1,
-    anchor_mass_factor=10.0,   # Anchor inertia
-    
-    # Transitive edges
-    use_transitive_edges=True,
-    transitive_edge_hops=3,
-    
-    # Die area
-    die_width=1000.0,
-    die_height=1000.0,
-)
-```
-
-## 🔑 Key Advantages
-
-1. **No Clustering:** Maintains individual cell identities throughout
-2. **Global-to-Local:** Places critical cells first, ensuring optimal global structure
-3. **Natural Anchors:** RAMs, DSPs, IP cores automatically emerge as high-level anchors
-4. **Scalability:** O(n log n) complexity with proper implementation
-
-## 📚 Algorithm Comparison
-
-| Feature | Traditional Multilevel | H-Anchor |
-|---------|----------------------|----------|
-| Cell Identity | Merged into super-nodes | Preserved |
-| Global Nets | Cut during partitioning | Placed first (anchors) |
-| Hierarchy Basis | Clustering | Centrality + Inhibition |
-| Analogy | hMETIS/MLPart | HNSW |
-
-## 🔬 Technical Details
-
-### Transitive Closure Edges
-
-Prevents anchor "folding" when anchors connect only via unplaced cells:
-
-```
-Before: A ──?── [unplaced] ──?── B
-After:  A ────────────────────── B (weight = 1/path_length)
-```
-
-### Force-Directed with Variable Mass
-
-```python
-displacement = forces / mass[node]
-# Anchors: high mass → small displacement
-# New cells: low mass → large displacement
-```
-
-### Spatial Inhibition
-
-Ensures anchors don't cluster together:
-```python
-for node in sorted_by_score:
-    if node not in covered:
-        select_as_anchor(node)
-        for neighbor in graph.neighbors(node):
-            covered.add(neighbor)  # Suppress neighbors
-```
+- **C++ Core**: OpenMP parallelized force computation
+- **Deterministic**: `schedule(static)` ensures reproducible results
+- **Module Awareness**: Visualize hierarchical module boundaries
+- **Flexible Forces**: Configurable repulsion, attraction, overlap prevention
+- **Global Optimization**: `spread_factor` and `global_attraction` for layout control
 
 ## 📝 License
 
@@ -219,5 +158,4 @@ MIT License
 Inspired by:
 - HNSW: Hierarchical Navigable Small World graphs
 - Force-directed graph drawing (Fruchterman-Reingold)
-- Multilevel placement (hMETIS, MLPart)
-
+- Multilevel placement algorithms
