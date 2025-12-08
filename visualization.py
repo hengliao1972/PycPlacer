@@ -1177,3 +1177,310 @@ def visualize_placement(placer: HAnchorPlacer, include_detailed: bool = True):
     print("Visualizing wirelength distribution...")
     viz.plot_wirelength_distribution()
 
+
+def plot_placement_comparison(
+    original_positions: Dict[str, Tuple[float, float]],
+    updated_positions: Dict[str, Tuple[float, float]],
+    changed_nodes: Optional[Set[str]] = None,
+    graph: Optional[nx.Graph] = None,
+    die_width: float = 1000.0,
+    die_height: float = 1000.0,
+    original_time: float = 0.0,
+    update_time: float = 0.0,
+    original_hpwl: float = 0.0,
+    updated_hpwl: float = 0.0,
+    title: str = "Placement Comparison",
+    save_path: Optional[str] = None
+):
+    """
+    比较原始布局和更新后布局，高亮显示变化的单元。
+    
+    Plot both original and updated placements side by side, 
+    highlighting the moved/changed cells.
+    
+    Args:
+        original_positions: Dict mapping cell IDs to (x, y) positions before update
+        updated_positions: Dict mapping cell IDs to (x, y) positions after update
+        changed_nodes: Optional set of node names that were explicitly changed
+        graph: Optional NetworkX graph for edge drawing
+        die_width: Die width for boundary
+        die_height: Die height for boundary
+        original_time: Time taken for original placement (seconds)
+        update_time: Time taken for incremental update (seconds)
+        original_hpwl: HPWL of original placement
+        updated_hpwl: HPWL of updated placement
+        title: Plot title
+        save_path: Optional path to save the figure
+    """
+    # Create figure with 2 subplots side by side + a third for legend/stats
+    fig = plt.figure(figsize=(20, 10))
+    fig.patch.set_facecolor(COLORS['background'])
+    
+    # Three subplots: Original, Updated, Stats/Legend
+    ax1 = fig.add_axes([0.02, 0.1, 0.42, 0.8])  # Original
+    ax2 = fig.add_axes([0.46, 0.1, 0.42, 0.8])  # Updated
+    ax_stats = fig.add_axes([0.90, 0.1, 0.09, 0.8])  # Stats panel
+    
+    for ax in [ax1, ax2]:
+        ax.set_facecolor(COLORS['background'])
+        ax.tick_params(colors=COLORS['text'])
+        ax.xaxis.label.set_color(COLORS['text'])
+        ax.yaxis.label.set_color(COLORS['text'])
+        ax.title.set_color(COLORS['text'])
+        for spine in ax.spines.values():
+            spine.set_color(COLORS['grid'])
+        ax.grid(False)
+    
+    ax_stats.set_facecolor(COLORS['background'])
+    ax_stats.axis('off')
+    
+    # Detect moved cells by comparing positions
+    moved_threshold = 1.0  # Minimum distance to be considered "moved"
+    moved_cells = set()
+    all_cells = set(original_positions.keys()) & set(updated_positions.keys())
+    
+    for cell in all_cells:
+        orig_pos = original_positions[cell]
+        new_pos = updated_positions[cell]
+        dist = np.sqrt((orig_pos[0] - new_pos[0])**2 + (orig_pos[1] - new_pos[1])**2)
+        if dist > moved_threshold:
+            moved_cells.add(cell)
+    
+    # If changed_nodes provided, combine with moved_cells
+    explicitly_changed = changed_nodes if changed_nodes else set()
+    
+    # Colors for different cell categories
+    COLOR_UNCHANGED = '#66D9EF'      # Cyan - cells that didn't move
+    COLOR_MOVED = '#FD971F'          # Orange - cells that moved due to propagation
+    COLOR_EXPLICIT = '#F92672'       # Pink/Magenta - explicitly changed cells
+    COLOR_ARROW = '#A6E22E'          # Green - movement arrows
+    
+    def draw_placement(ax, positions, title_text, is_updated=False):
+        """Draw a single placement on the given axes."""
+        # Draw die boundary
+        die_rect = patches.Rectangle(
+            (0, 0), die_width, die_height,
+            linewidth=2, edgecolor=COLORS['text'],
+            facecolor='none'
+        )
+        ax.add_patch(die_rect)
+        
+        # Draw edges if graph provided
+        if graph is not None:
+            edge_positions = []
+            for u, v in graph.edges():
+                if u in positions and v in positions:
+                    pos_u = positions[u]
+                    pos_v = positions[v]
+                    if isinstance(pos_u, np.ndarray):
+                        pos_u = tuple(pos_u)
+                    if isinstance(pos_v, np.ndarray):
+                        pos_v = tuple(pos_v)
+                    edge_positions.append([pos_u, pos_v])
+            
+            if edge_positions:
+                edge_collection = LineCollection(
+                    edge_positions,
+                    colors=COLORS['edge'],
+                    alpha=0.15,
+                    linewidths=0.3
+                )
+                ax.add_collection(edge_collection)
+        
+        # Categorize cells
+        unchanged_x, unchanged_y = [], []
+        moved_x, moved_y = [], []
+        explicit_x, explicit_y = [], []
+        
+        for cell, pos in positions.items():
+            if isinstance(pos, np.ndarray):
+                x, y = pos[0], pos[1]
+            else:
+                x, y = pos
+            
+            if cell in explicitly_changed:
+                explicit_x.append(x)
+                explicit_y.append(y)
+            elif cell in moved_cells:
+                moved_x.append(x)
+                moved_y.append(y)
+            else:
+                unchanged_x.append(x)
+                unchanged_y.append(y)
+        
+        # Draw unchanged cells (smallest)
+        if unchanged_x:
+            ax.scatter(unchanged_x, unchanged_y, c=COLOR_UNCHANGED, s=8, 
+                      alpha=0.6, edgecolors='none', label='Unchanged')
+        
+        # Draw propagation-moved cells (medium)
+        if moved_x:
+            ax.scatter(moved_x, moved_y, c=COLOR_MOVED, s=25, 
+                      alpha=0.85, edgecolors='white', linewidths=0.5,
+                      label='Propagation Moved')
+        
+        # Draw explicitly changed cells (largest, highlighted)
+        if explicit_x:
+            ax.scatter(explicit_x, explicit_y, c=COLOR_EXPLICIT, s=80, 
+                      alpha=1.0, edgecolors='white', linewidths=1.5,
+                      marker='*', label='Explicitly Moved')
+        
+        # Draw movement arrows on the updated plot
+        if is_updated:
+            for cell in moved_cells | explicitly_changed:
+                if cell in original_positions and cell in updated_positions:
+                    orig = original_positions[cell]
+                    new = updated_positions[cell]
+                    if isinstance(orig, np.ndarray):
+                        orig = tuple(orig)
+                    if isinstance(new, np.ndarray):
+                        new = tuple(new)
+                    
+                    dx = new[0] - orig[0]
+                    dy = new[1] - orig[1]
+                    dist = np.sqrt(dx**2 + dy**2)
+                    
+                    if dist > moved_threshold:
+                        # Draw arrow from original to new position
+                        ax.annotate('', xy=new, xytext=orig,
+                                   arrowprops=dict(
+                                       arrowstyle='->',
+                                       color=COLOR_ARROW,
+                                       alpha=0.7,
+                                       linewidth=1.5,
+                                       shrinkA=3,
+                                       shrinkB=3
+                                   ))
+        
+        ax.set_xlim(-50, die_width + 50)
+        ax.set_ylim(-50, die_height + 50)
+        ax.set_xlabel("X", fontsize=10)
+        ax.set_ylabel("Y", fontsize=10)
+        ax.set_title(title_text, fontsize=12, color=COLORS['text'])
+        ax.set_aspect('equal')
+    
+    # Draw both placements
+    draw_placement(ax1, original_positions, 
+                   f"Original Placement\n({len(original_positions):,} cells)", 
+                   is_updated=False)
+    draw_placement(ax2, updated_positions, 
+                   f"Updated Placement\n({len(updated_positions):,} cells)", 
+                   is_updated=True)
+    
+    # Add legends to both plots
+    for ax in [ax1, ax2]:
+        ax.legend(loc='upper right', facecolor=COLORS['background'], 
+                 labelcolor=COLORS['text'], fontsize=8)
+    
+    # Draw statistics panel
+    stats_y = 0.95
+    ax_stats.text(0.5, stats_y, "Statistics", fontsize=12, 
+                 color=COLORS['text'], ha='center', fontweight='bold')
+    
+    stats_y -= 0.06
+    ax_stats.axhline(y=stats_y, xmin=0.1, xmax=0.9, color=COLORS['grid'], linewidth=1)
+    
+    # Timing stats
+    stats_y -= 0.06
+    ax_stats.text(0.5, stats_y, "Runtime", fontsize=10, 
+                 color=COLORS['text'], ha='center', fontweight='bold')
+    
+    stats_y -= 0.05
+    ax_stats.text(0.1, stats_y, f"Original:", fontsize=9, color=COLORS['grid'])
+    ax_stats.text(0.9, stats_y, f"{original_time:.3f}s", fontsize=9, 
+                 color='#A6E22E', ha='right')
+    
+    stats_y -= 0.04
+    ax_stats.text(0.1, stats_y, f"Update:", fontsize=9, color=COLORS['grid'])
+    ax_stats.text(0.9, stats_y, f"{update_time:.3f}s", fontsize=9, 
+                 color='#A6E22E', ha='right')
+    
+    if original_time > 0:
+        speedup = original_time / max(update_time, 0.001)
+        stats_y -= 0.04
+        ax_stats.text(0.1, stats_y, f"Speedup:", fontsize=9, color=COLORS['grid'])
+        ax_stats.text(0.9, stats_y, f"{speedup:.1f}x", fontsize=9, 
+                     color='#F92672', ha='right', fontweight='bold')
+    
+    # HPWL stats
+    stats_y -= 0.08
+    ax_stats.text(0.5, stats_y, "HPWL", fontsize=10, 
+                 color=COLORS['text'], ha='center', fontweight='bold')
+    
+    stats_y -= 0.05
+    ax_stats.text(0.1, stats_y, f"Original:", fontsize=9, color=COLORS['grid'])
+    ax_stats.text(0.9, stats_y, f"{original_hpwl:,.0f}", fontsize=9, 
+                 color='#66D9EF', ha='right')
+    
+    stats_y -= 0.04
+    ax_stats.text(0.1, stats_y, f"Updated:", fontsize=9, color=COLORS['grid'])
+    ax_stats.text(0.9, stats_y, f"{updated_hpwl:,.0f}", fontsize=9, 
+                 color='#66D9EF', ha='right')
+    
+    if original_hpwl > 0:
+        hpwl_change = ((updated_hpwl - original_hpwl) / original_hpwl) * 100
+        stats_y -= 0.04
+        ax_stats.text(0.1, stats_y, f"Change:", fontsize=9, color=COLORS['grid'])
+        color = '#A6E22E' if hpwl_change <= 0 else '#F92672'
+        sign = '+' if hpwl_change > 0 else ''
+        ax_stats.text(0.9, stats_y, f"{sign}{hpwl_change:.1f}%", fontsize=9, 
+                     color=color, ha='right')
+    
+    # Cell change stats
+    stats_y -= 0.08
+    ax_stats.text(0.5, stats_y, "Cell Changes", fontsize=10, 
+                 color=COLORS['text'], ha='center', fontweight='bold')
+    
+    stats_y -= 0.05
+    ax_stats.text(0.1, stats_y, f"Explicit:", fontsize=9, color=COLORS['grid'])
+    ax_stats.text(0.9, stats_y, f"{len(explicitly_changed)}", fontsize=9, 
+                 color='#F92672', ha='right')
+    
+    stats_y -= 0.04
+    ax_stats.text(0.1, stats_y, f"Propagated:", fontsize=9, color=COLORS['grid'])
+    ax_stats.text(0.9, stats_y, f"{len(moved_cells - explicitly_changed)}", fontsize=9, 
+                 color='#FD971F', ha='right')
+    
+    stats_y -= 0.04
+    ax_stats.text(0.1, stats_y, f"Unchanged:", fontsize=9, color=COLORS['grid'])
+    unchanged_count = len(all_cells) - len(moved_cells) - len(explicitly_changed - moved_cells)
+    ax_stats.text(0.9, stats_y, f"{unchanged_count}", fontsize=9, 
+                 color='#66D9EF', ha='right')
+    
+    # Legend
+    stats_y -= 0.1
+    ax_stats.text(0.5, stats_y, "Legend", fontsize=10, 
+                 color=COLORS['text'], ha='center', fontweight='bold')
+    
+    stats_y -= 0.05
+    ax_stats.scatter([0.15], [stats_y], c=COLOR_UNCHANGED, s=40, marker='o')
+    ax_stats.text(0.25, stats_y, "Unchanged", fontsize=8, color=COLORS['text'], va='center')
+    
+    stats_y -= 0.04
+    ax_stats.scatter([0.15], [stats_y], c=COLOR_MOVED, s=50, marker='o', edgecolors='white', linewidths=0.5)
+    ax_stats.text(0.25, stats_y, "Propagated", fontsize=8, color=COLORS['text'], va='center')
+    
+    stats_y -= 0.04
+    ax_stats.scatter([0.15], [stats_y], c=COLOR_EXPLICIT, s=60, marker='*', edgecolors='white', linewidths=1)
+    ax_stats.text(0.25, stats_y, "Explicit", fontsize=8, color=COLORS['text'], va='center')
+    
+    stats_y -= 0.04
+    ax_stats.annotate('', xy=(0.25, stats_y), xytext=(0.05, stats_y),
+                     arrowprops=dict(arrowstyle='->', color=COLOR_ARROW, linewidth=1.5))
+    ax_stats.text(0.32, stats_y, "Move", fontsize=8, color=COLORS['text'], va='center')
+    
+    ax_stats.set_xlim(0, 1)
+    ax_stats.set_ylim(0, 1)
+    
+    # Main title
+    fig.suptitle(title, fontsize=14, color=COLORS['text'], y=0.98)
+    
+    if save_path:
+        plt.savefig(save_path, dpi=150, facecolor=COLORS['background'], bbox_inches='tight')
+        plt.close(fig)
+        print(f"✓ Comparison saved to {save_path}")
+    else:
+        plt.show()
+    
+    return fig
+

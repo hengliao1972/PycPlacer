@@ -773,40 +773,120 @@ void HAnchorCore::incremental_update_positions(
 ) {
     std::cout << "Incremental position update: " << node_indices.size() << " nodes" << std::endl;
     
-    // Step 1: Set new positions for specified nodes
+    // Step 1: Calculate displacement vectors for each moved node
+    std::vector<std::pair<double, double>> displacements(node_indices.size());
     for (size_t i = 0; i < node_indices.size(); ++i) {
         int idx = node_indices[i];
         if (idx >= 0 && idx < graph_.num_nodes()) {
+            double old_x = graph_.cells[idx].pos.x;
+            double old_y = graph_.cells[idx].pos.y;
+            displacements[i] = {new_x[i] - old_x, new_y[i] - old_y};
+            
+            // Set new position for moved node
             graph_.cells[idx].pos.x = new_x[i];
             graph_.cells[idx].pos.y = new_y[i];
         }
     }
     
-    // Step 2: Find affected region
-    auto affected = find_affected_region(node_indices, propagation_radius);
-    std::cout << "  Affected region: " << affected.size() << " nodes" << std::endl;
+    if (propagation_radius <= 0) {
+        // No propagation, just move the specified nodes
+        std::cout << "  Affected region: " << node_indices.size() << " nodes" << std::endl;
+        std::cout << "  HPWL after update: " << get_hpwl() << std::endl;
+        return;
+    }
     
-    // Step 3: Find boundary nodes (neighbors of affected region that are not in it)
-    std::unordered_set<int> boundary;
-    for (int node : affected) {
-        for (int neighbor : graph_.neighbors(node)) {
-            if (affected.find(neighbor) == affected.end()) {
-                boundary.insert(neighbor);
+    // Step 2: Ripple propagation (like water waves)
+    // Use BFS to propagate displacement with decay
+    std::unordered_set<int> moved_set(node_indices.begin(), node_indices.end());
+    std::unordered_map<int, int> node_hop;  // node -> hop distance from moved nodes
+    std::unordered_map<int, std::pair<double, double>> node_displacement;  // accumulated displacement
+    
+    // Initialize with moved nodes
+    std::queue<int> bfs_queue;
+    for (size_t i = 0; i < node_indices.size(); ++i) {
+        int idx = node_indices[i];
+        node_hop[idx] = 0;
+        node_displacement[idx] = displacements[i];
+        
+        // Add neighbors to queue
+        for (int neighbor : graph_.neighbors(idx)) {
+            if (moved_set.find(neighbor) == moved_set.end() && node_hop.find(neighbor) == node_hop.end()) {
+                node_hop[neighbor] = 1;
+                bfs_queue.push(neighbor);
             }
         }
     }
     
-    // The moved nodes themselves are fixed at their new positions
-    std::unordered_set<int> fixed_nodes(node_indices.begin(), node_indices.end());
-    for (int b : boundary) {
-        fixed_nodes.insert(b);
+    // BFS propagation
+    while (!bfs_queue.empty()) {
+        int current = bfs_queue.front();
+        bfs_queue.pop();
+        
+        int hop = node_hop[current];
+        
+        // Calculate weighted average displacement from neighbors that are closer to source
+        double total_dx = 0.0, total_dy = 0.0;
+        double total_weight = 0.0;
+        
+        for (int neighbor : graph_.neighbors(current)) {
+            auto it = node_hop.find(neighbor);
+            if (it != node_hop.end() && it->second < hop) {
+                // This neighbor is closer to the source
+                auto disp_it = node_displacement.find(neighbor);
+                if (disp_it != node_displacement.end()) {
+                    // Weight by edge weight if available
+                    double edge_weight = 1.0;
+                    for (const auto& edge : graph_.edges) {
+                        if ((edge.from == current && edge.to == neighbor) ||
+                            (edge.from == neighbor && edge.to == current)) {
+                            edge_weight = edge.weight;
+                            break;
+                        }
+                    }
+                    total_dx += disp_it->second.first * edge_weight;
+                    total_dy += disp_it->second.second * edge_weight;
+                    total_weight += edge_weight;
+                }
+            }
+        }
+        
+        if (total_weight > 0) {
+            // Decay factor: displacement decreases with hop distance
+            // decay = 1 / (1 + hop * decay_rate)
+            // This creates a gentle ripple effect
+            double decay_rate = 2.0;  // Higher = faster decay
+            double decay = 1.0 / (1.0 + hop * decay_rate);
+            
+            double avg_dx = (total_dx / total_weight) * decay;
+            double avg_dy = (total_dy / total_weight) * decay;
+            
+            // Store displacement for this node
+            node_displacement[current] = {avg_dx, avg_dy};
+            
+            // Apply displacement (with bounds checking)
+            double new_px = graph_.cells[current].pos.x + avg_dx;
+            double new_py = graph_.cells[current].pos.y + avg_dy;
+            
+            // Clamp to die area
+            new_px = std::max(0.0, std::min(config_.die_width, new_px));
+            new_py = std::max(0.0, std::min(config_.die_height, new_py));
+            
+            graph_.cells[current].pos.x = new_px;
+            graph_.cells[current].pos.y = new_py;
+        }
+        
+        // Add next hop neighbors to queue
+        if (hop < propagation_radius) {
+            for (int neighbor : graph_.neighbors(current)) {
+                if (node_hop.find(neighbor) == node_hop.end()) {
+                    node_hop[neighbor] = hop + 1;
+                    bfs_queue.push(neighbor);
+                }
+            }
+        }
     }
     
-    // Step 4: Local optimization
-    // Reduce iterations for incremental update (faster)
-    int local_iterations = std::max(20, config_.refinement_iterations / 2);
-    local_optimize(affected, fixed_nodes, local_iterations);
-    
+    std::cout << "  Affected region: " << node_hop.size() << " nodes (ripple propagation)" << std::endl;
     std::cout << "  HPWL after update: " << get_hpwl() << std::endl;
 }
 
