@@ -392,8 +392,8 @@ def get_available_benchmarks(benchmark_dir: str = None) -> Dict[str, str]:
                 name = os.path.splitext(f)[0]
                 benchmarks[f"lgsynth91/{name}"] = os.path.join(lgsynth_dir, f)
     
-    # MCNC benchmarks
-    mcnc_comb = os.path.join(hdl_dir, "mcnc", "Combinational")
+    # MCNC benchmarks (blif files are in Combinational/blif/)
+    mcnc_comb = os.path.join(hdl_dir, "mcnc", "Combinational", "blif")
     if os.path.exists(mcnc_comb):
         for f in os.listdir(mcnc_comb):
             if f.endswith('.blif'):
