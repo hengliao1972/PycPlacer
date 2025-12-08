@@ -116,17 +116,28 @@ python run_real_benchmark.py large_cpu
 
 ### Real Benchmarks (optional)
 
-To run ISCAS89, MCNC, and other real benchmarks, download the benchmark data:
+Use the benchmark installer to download standard circuits:
 
 ```bash
-# Create benchmarks_data directory and download BLIF files
-mkdir -p benchmarks_data/iscas89
-# Download from: https://github.com/cuhk-eda/benchmarks
-# or: https://cadlab.cs.ucla.edu/~pubbench/
+# List available benchmark suites
+python install_benchmarks.py --list
 
-# Then run:
+# Install specific suite
+python install_benchmarks.py iscas89
+
+# Install all benchmarks (~100MB)
+python install_benchmarks.py all
+
+# Run real benchmark
 python run_real_benchmark.py iscas89/s38417
 ```
+
+Available suites:
+- **ISCAS85**: 10 combinational circuits
+- **ISCAS89**: 31 sequential circuits (includes s38417 ★)
+- **EPFL**: Arithmetic + random control benchmarks
+- **ITC99**: Large sequential circuits
+- **MCNC**: Classic combinational circuits
 
 ## 🎨 Visualization
 
