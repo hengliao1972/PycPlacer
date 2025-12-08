@@ -208,6 +208,224 @@ class HAnchorPlacer:
         """Compute total Half-Perimeter Wirelength (HPWL)."""
         return self._cpp_core.get_hpwl()
     
+    # =========================================================================
+    # Incremental Update API
+    # =========================================================================
+    
+    def update_positions(
+        self,
+        node_positions: Dict[str, Tuple[float, float]],
+        propagation_radius: int = 2
+    ) -> float:
+        """
+        Update positions of specific nodes and propagate changes locally.
+        
+        This is much faster than re-running full placement when only a few
+        anchor cells are moved.
+        
+        Args:
+            node_positions: Dict mapping node names to new (x, y) positions
+            propagation_radius: How many hops of neighbors to re-optimize
+                               (0 = only moved nodes, 2 = recommended default)
+        
+        Returns:
+            New HPWL after update
+            
+        Example:
+            # Move two cells to new positions
+            placer.update_positions({
+                'cell_123': (500, 300),
+                'cell_456': (600, 400)
+            })
+        """
+        node_indices = []
+        new_x = []
+        new_y = []
+        
+        for name, (x, y) in node_positions.items():
+            if name in self._node_to_idx:
+                node_indices.append(self._node_to_idx[name])
+                new_x.append(x)
+                new_y.append(y)
+        
+        if node_indices:
+            self._cpp_core.incremental_update_positions(
+                node_indices, new_x, new_y, propagation_radius
+            )
+            self._sync_positions()
+        
+        return self.compute_wirelength()
+    
+    def add_nodes(
+        self,
+        new_cells: Dict[str, Cell],
+        new_edges: List[Tuple[str, str, float]] = None
+    ) -> List[str]:
+        """
+        Incrementally add new nodes and edges to the placed design.
+        
+        Args:
+            new_cells: Dict mapping new cell names to Cell objects
+            new_edges: List of (from_name, to_name, weight) tuples
+                       Can reference both existing and new nodes
+        
+        Returns:
+            List of added cell names
+            
+        Example:
+            new_cells = {'new_gate': Cell(id='new_gate')}
+            new_edges = [('existing_cell', 'new_gate', 1.0)]
+            placer.add_nodes(new_cells, new_edges)
+        """
+        if not new_cells:
+            return []
+        
+        # Prepare data for C++
+        node_names = list(new_cells.keys())
+        node_widths = [c.width for c in new_cells.values()]
+        node_heights = [c.height for c in new_cells.values()]
+        
+        # Process edges
+        edge_from = []
+        edge_to = []
+        edge_weights = []
+        
+        # First, add new nodes to our mapping
+        start_idx = len(self._node_names)
+        for i, name in enumerate(node_names):
+            self._node_to_idx[name] = start_idx + i
+        self._node_names.extend(node_names)
+        
+        if new_edges:
+            for from_name, to_name, weight in new_edges:
+                if from_name in self._node_to_idx and to_name in self._node_to_idx:
+                    edge_from.append(self._node_to_idx[from_name])
+                    edge_to.append(self._node_to_idx[to_name])
+                    edge_weights.append(weight)
+        
+        # Add to C++ core
+        self._cpp_core.incremental_add_nodes(
+            node_names, node_widths, node_heights,
+            edge_from, edge_to, edge_weights
+        )
+        
+        # Update local state
+        self.cells.update(new_cells)
+        self._sync_positions()
+        
+        return node_names
+    
+    def remove_nodes(self, node_names: List[str]) -> Dict[str, str]:
+        """
+        Incrementally remove nodes from the placed design.
+        
+        Args:
+            node_names: List of node names to remove
+            
+        Returns:
+            Dict mapping old node names to new indices (for nodes that remain)
+            
+        Note:
+            Removing high-level anchor nodes will trigger more extensive
+            re-optimization than removing low-level nodes.
+        """
+        node_indices = []
+        for name in node_names:
+            if name in self._node_to_idx:
+                node_indices.append(self._node_to_idx[name])
+        
+        if not node_indices:
+            return {}
+        
+        # Call C++ removal
+        old_to_new = self._cpp_core.incremental_remove_nodes(node_indices)
+        
+        # Update local state
+        for name in node_names:
+            if name in self.cells:
+                del self.cells[name]
+            if name in self.positions:
+                del self.positions[name]
+            if name in self.legal_positions:
+                del self.legal_positions[name]
+        
+        # Rebuild node mapping
+        removed_set = set(node_names)
+        new_node_names = [n for n in self._node_names if n not in removed_set]
+        self._node_names = new_node_names
+        self._node_to_idx = {name: i for i, name in enumerate(new_node_names)}
+        
+        self._sync_positions()
+        
+        return {self._node_names[new_idx]: new_idx 
+                for old_idx, new_idx in old_to_new.items()
+                if new_idx < len(self._node_names)}
+    
+    def add_edges(self, edges: List[Tuple[str, str, float]]):
+        """
+        Add edges between existing nodes.
+        
+        Args:
+            edges: List of (from_name, to_name, weight) tuples
+        """
+        edge_from = []
+        edge_to = []
+        edge_weights = []
+        
+        for from_name, to_name, weight in edges:
+            if from_name in self._node_to_idx and to_name in self._node_to_idx:
+                edge_from.append(self._node_to_idx[from_name])
+                edge_to.append(self._node_to_idx[to_name])
+                edge_weights.append(weight)
+        
+        if edge_from:
+            self._cpp_core.incremental_add_edges(edge_from, edge_to, edge_weights)
+            self._sync_positions()
+    
+    def remove_edges(self, edges: List[Tuple[str, str]]):
+        """
+        Remove edges from the design.
+        
+        Args:
+            edges: List of (from_name, to_name) tuples
+        """
+        edge_from = []
+        edge_to = []
+        
+        for from_name, to_name in edges:
+            if from_name in self._node_to_idx and to_name in self._node_to_idx:
+                edge_from.append(self._node_to_idx[from_name])
+                edge_to.append(self._node_to_idx[to_name])
+        
+        if edge_from:
+            self._cpp_core.incremental_remove_edges(edge_from, edge_to)
+            self._sync_positions()
+    
+    def get_node_layer(self, node_name: str) -> int:
+        """
+        Get the hierarchy layer of a node.
+        
+        Returns:
+            Layer index (0 = top/most important, higher = lower level)
+            Returns -1 if node not found
+        """
+        if node_name not in self._node_to_idx:
+            return -1
+        return self._cpp_core.get_node_layer(self._node_to_idx[node_name])
+    
+    def _sync_positions(self):
+        """Sync positions from C++ to Python state."""
+        pos_x = self._cpp_core.get_positions_x()
+        pos_y = self._cpp_core.get_positions_y()
+        
+        for i, name in enumerate(self._node_names):
+            if i < len(pos_x) and i < len(pos_y):
+                self.positions[name] = np.array([pos_x[i], pos_y[i]])
+                self.legal_positions[name] = (pos_x[i], pos_y[i])
+                if name in self.cells:
+                    self.cells[name].x = pos_x[i]
+                    self.cells[name].y = pos_y[i]
+    
     def get_placement_stats(self) -> str:
         """Return placement quality statistics."""
         wl = self.compute_wirelength()

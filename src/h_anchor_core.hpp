@@ -246,6 +246,116 @@ public:
     // Access to layers for visualization
     std::vector<std::vector<int>> get_layers() const;
     
+    // =========================================================================
+    // Incremental Update API
+    // =========================================================================
+    
+    /**
+     * Update positions of anchor cells and propagate changes locally.
+     * 
+     * @param node_indices Indices of nodes whose positions are being updated
+     * @param new_x New X coordinates for these nodes
+     * @param new_y New Y coordinates for these nodes
+     * @param propagation_radius How many hops of neighbors to re-optimize (0=only moved nodes)
+     * 
+     * Algorithm:
+     * 1. Set new positions for specified nodes
+     * 2. Find affected region (BFS up to propagation_radius)
+     * 3. Run local force-directed optimization on affected region
+     * 4. Higher-layer nodes have more mass (move less), lower-layer nodes adjust more
+     */
+    void incremental_update_positions(
+        const std::vector<int>& node_indices,
+        const std::vector<double>& new_x,
+        const std::vector<double>& new_y,
+        int propagation_radius = 2
+    );
+    
+    /**
+     * Incrementally add new nodes and edges to the netlist.
+     * 
+     * @param node_names Names of new nodes
+     * @param node_widths Widths of new nodes
+     * @param node_heights Heights of new nodes
+     * @param edge_from Source node indices for new edges (can reference existing or new nodes)
+     * @param edge_to Target node indices for new edges
+     * @param edge_weights Weights for new edges
+     * @return Starting index of the newly added nodes
+     * 
+     * Algorithm:
+     * 1. Add new nodes to graph
+     * 2. Add new edges (rebuild adjacency)
+     * 3. Compute scores for new nodes
+     * 4. Assign new nodes to appropriate layer based on their connectivity
+     * 5. Project new nodes to weighted center of neighbors
+     * 6. Run local optimization around new nodes
+     */
+    int incremental_add_nodes(
+        const std::vector<std::string>& node_names,
+        const std::vector<double>& node_widths,
+        const std::vector<double>& node_heights,
+        const std::vector<int>& edge_from,
+        const std::vector<int>& edge_to,
+        const std::vector<double>& edge_weights
+    );
+    
+    /**
+     * Incrementally remove nodes and their edges.
+     * 
+     * @param node_indices Indices of nodes to remove
+     * 
+     * Algorithm:
+     * 1. Identify layer level of removed nodes
+     * 2. Remove nodes and their edges
+     * 3. If high-level anchor removed: may need to promote a neighbor to anchor
+     * 4. Run local optimization on affected area
+     * 
+     * Note: Node indices will be invalidated after removal. 
+     * Returns mapping of old indices to new indices.
+     */
+    std::unordered_map<int, int> incremental_remove_nodes(
+        const std::vector<int>& node_indices
+    );
+    
+    /**
+     * Add edges between existing nodes.
+     * 
+     * @param edge_from Source node indices
+     * @param edge_to Target node indices  
+     * @param edge_weights Edge weights
+     * 
+     * Algorithm:
+     * 1. Add new edges to graph
+     * 2. Rebuild adjacency for affected nodes
+     * 3. Run local optimization on nodes connected by new edges
+     */
+    void incremental_add_edges(
+        const std::vector<int>& edge_from,
+        const std::vector<int>& edge_to,
+        const std::vector<double>& edge_weights
+    );
+    
+    /**
+     * Remove edges from the graph.
+     * 
+     * @param edge_from Source node indices of edges to remove
+     * @param edge_to Target node indices of edges to remove
+     * 
+     * Algorithm:
+     * 1. Remove specified edges
+     * 2. Rebuild adjacency for affected nodes
+     * 3. Run local optimization on affected nodes
+     */
+    void incremental_remove_edges(
+        const std::vector<int>& edge_from,
+        const std::vector<int>& edge_to
+    );
+    
+    /**
+     * Get the layer index of a node (0=top/most important, higher=lower level)
+     */
+    int get_node_layer(int node_idx) const;
+    
 private:
     PlacementConfig config_;
     Graph graph_;
@@ -262,6 +372,22 @@ private:
         const std::vector<int>& current_nodes,
         const std::unordered_set<int>& anchors
     );
+    
+    // Incremental update helpers
+    std::unordered_set<int> find_affected_region(
+        const std::vector<int>& seed_nodes,
+        int radius
+    );
+    
+    void local_optimize(
+        const std::unordered_set<int>& affected_nodes,
+        const std::unordered_set<int>& fixed_boundary,
+        int iterations
+    );
+    
+    void assign_layer_to_new_nodes(const std::vector<int>& new_nodes);
+    
+    double compute_node_score(int node_idx) const;
 };
 
 }  // namespace hanchor

@@ -5,6 +5,7 @@
 #include "h_anchor_core.hpp"
 #include <iostream>
 #include <queue>
+#include <set>
 #include <chrono>
 
 namespace hanchor {
@@ -652,6 +653,408 @@ double HAnchorCore::get_hpwl() const {
         total += (std::abs(p1.x - p2.x) + std::abs(p1.y - p2.y)) * edge.weight;
     }
     return total;
+}
+
+// ============================================================================
+// Incremental Update Implementation
+// ============================================================================
+
+int HAnchorCore::get_node_layer(int node_idx) const {
+    if (node_idx < 0 || node_idx >= graph_.num_nodes()) return -1;
+    return graph_.cells[node_idx].layer;
+}
+
+std::unordered_set<int> HAnchorCore::find_affected_region(
+    const std::vector<int>& seed_nodes,
+    int radius
+) {
+    // BFS to find all nodes within 'radius' hops of seed nodes
+    std::unordered_set<int> affected;
+    std::queue<std::pair<int, int>> queue;  // (node, distance)
+    
+    for (int seed : seed_nodes) {
+        if (seed >= 0 && seed < graph_.num_nodes()) {
+            queue.push({seed, 0});
+            affected.insert(seed);
+        }
+    }
+    
+    while (!queue.empty()) {
+        auto [node, dist] = queue.front();
+        queue.pop();
+        
+        if (dist >= radius) continue;
+        
+        for (int neighbor : graph_.neighbors(node)) {
+            if (affected.find(neighbor) == affected.end()) {
+                affected.insert(neighbor);
+                queue.push({neighbor, dist + 1});
+            }
+        }
+    }
+    
+    return affected;
+}
+
+void HAnchorCore::local_optimize(
+    const std::unordered_set<int>& affected_nodes,
+    const std::unordered_set<int>& fixed_boundary,
+    int iterations
+) {
+    if (affected_nodes.empty()) return;
+    
+    // Convert to vector for force engine
+    std::vector<int> active_nodes(affected_nodes.begin(), affected_nodes.end());
+    
+    // Assign masses based on layer level
+    // Higher layer (smaller index) = more mass = less movement
+    std::unordered_map<int, double> masses;
+    for (int node : active_nodes) {
+        int layer = graph_.cells[node].layer;
+        if (layer < 0) layer = static_cast<int>(layers_.size()) - 1;
+        
+        // Layer 0 (top) has highest mass, bottom layer has mass 1.0
+        double layer_factor = 1.0 + (layers_.size() - 1 - layer) * 0.5;
+        masses[node] = layer_factor;
+    }
+    
+    ForceDirectedEngine engine(config_);
+    engine.run_layout(graph_, active_nodes, fixed_boundary, masses, iterations);
+}
+
+double HAnchorCore::compute_node_score(int node_idx) const {
+    // Simple degree-based score for incremental updates
+    if (node_idx < 0 || node_idx >= graph_.num_nodes()) return 0.0;
+    
+    double degree = static_cast<double>(graph_.neighbors(node_idx).size());
+    double max_degree = 1.0;
+    for (const auto& cell : graph_.cells) {
+        max_degree = std::max(max_degree, static_cast<double>(graph_.neighbors(cell.id).size()));
+    }
+    
+    return degree / max_degree;
+}
+
+void HAnchorCore::assign_layer_to_new_nodes(const std::vector<int>& new_nodes) {
+    // Assign new nodes to the bottom layer by default,
+    // unless they have very high connectivity (then higher layer)
+    int bottom_layer = static_cast<int>(layers_.size()) - 1;
+    
+    for (int node : new_nodes) {
+        double score = compute_node_score(node);
+        graph_.cells[node].score = score;
+        
+        // Determine layer based on score
+        // High score -> higher layer (smaller index)
+        int assigned_layer = bottom_layer;
+        for (int l = 0; l < static_cast<int>(layers_.size()); ++l) {
+            // Check if score is high enough for this layer
+            double threshold = 1.0 - (l + 1.0) / layers_.size();
+            if (score >= threshold) {
+                assigned_layer = l;
+                break;
+            }
+        }
+        
+        graph_.cells[node].layer = assigned_layer;
+        
+        // Add to appropriate layer
+        if (assigned_layer < static_cast<int>(layers_.size())) {
+            layers_[assigned_layer].push_back(node);
+        }
+    }
+}
+
+void HAnchorCore::incremental_update_positions(
+    const std::vector<int>& node_indices,
+    const std::vector<double>& new_x,
+    const std::vector<double>& new_y,
+    int propagation_radius
+) {
+    std::cout << "Incremental position update: " << node_indices.size() << " nodes" << std::endl;
+    
+    // Step 1: Set new positions for specified nodes
+    for (size_t i = 0; i < node_indices.size(); ++i) {
+        int idx = node_indices[i];
+        if (idx >= 0 && idx < graph_.num_nodes()) {
+            graph_.cells[idx].pos.x = new_x[i];
+            graph_.cells[idx].pos.y = new_y[i];
+        }
+    }
+    
+    // Step 2: Find affected region
+    auto affected = find_affected_region(node_indices, propagation_radius);
+    std::cout << "  Affected region: " << affected.size() << " nodes" << std::endl;
+    
+    // Step 3: Find boundary nodes (neighbors of affected region that are not in it)
+    std::unordered_set<int> boundary;
+    for (int node : affected) {
+        for (int neighbor : graph_.neighbors(node)) {
+            if (affected.find(neighbor) == affected.end()) {
+                boundary.insert(neighbor);
+            }
+        }
+    }
+    
+    // The moved nodes themselves are fixed at their new positions
+    std::unordered_set<int> fixed_nodes(node_indices.begin(), node_indices.end());
+    for (int b : boundary) {
+        fixed_nodes.insert(b);
+    }
+    
+    // Step 4: Local optimization
+    // Reduce iterations for incremental update (faster)
+    int local_iterations = std::max(20, config_.refinement_iterations / 2);
+    local_optimize(affected, fixed_nodes, local_iterations);
+    
+    std::cout << "  HPWL after update: " << get_hpwl() << std::endl;
+}
+
+int HAnchorCore::incremental_add_nodes(
+    const std::vector<std::string>& node_names,
+    const std::vector<double>& node_widths,
+    const std::vector<double>& node_heights,
+    const std::vector<int>& edge_from,
+    const std::vector<int>& edge_to,
+    const std::vector<double>& edge_weights
+) {
+    int start_idx = graph_.num_nodes();
+    std::cout << "Incremental add: " << node_names.size() << " nodes, " 
+              << edge_from.size() << " edges" << std::endl;
+    
+    // Step 1: Add new nodes
+    std::vector<int> new_node_indices;
+    for (size_t i = 0; i < node_names.size(); ++i) {
+        double w = (i < node_widths.size()) ? node_widths[i] : 1.0;
+        double h = (i < node_heights.size()) ? node_heights[i] : 1.0;
+        graph_.add_node(node_names[i], w, h);
+        new_node_indices.push_back(start_idx + static_cast<int>(i));
+    }
+    
+    // Step 2: Add new edges
+    for (size_t i = 0; i < edge_from.size(); ++i) {
+        double weight = (i < edge_weights.size()) ? edge_weights[i] : 1.0;
+        graph_.add_edge(edge_from[i], edge_to[i], weight);
+    }
+    
+    // Step 3: Rebuild adjacency
+    graph_.build_adjacency();
+    
+    // Step 4: Assign layers to new nodes
+    assign_layer_to_new_nodes(new_node_indices);
+    
+    // Step 5: Project new nodes to weighted center of neighbors
+    std::unordered_set<int> existing_nodes;
+    for (int i = 0; i < start_idx; ++i) {
+        existing_nodes.insert(i);
+    }
+    project_new_nodes(new_node_indices, existing_nodes);
+    
+    // Step 6: Find affected region and optimize
+    auto affected = find_affected_region(new_node_indices, 2);
+    std::unordered_set<int> boundary;
+    for (int node : affected) {
+        for (int neighbor : graph_.neighbors(node)) {
+            if (affected.find(neighbor) == affected.end()) {
+                boundary.insert(neighbor);
+            }
+        }
+    }
+    
+    local_optimize(affected, boundary, config_.refinement_iterations / 2);
+    
+    std::cout << "  HPWL after add: " << get_hpwl() << std::endl;
+    return start_idx;
+}
+
+std::unordered_map<int, int> HAnchorCore::incremental_remove_nodes(
+    const std::vector<int>& node_indices
+) {
+    std::cout << "Incremental remove: " << node_indices.size() << " nodes" << std::endl;
+    
+    // Find affected region before removal
+    auto affected = find_affected_region(node_indices, 2);
+    
+    // Remove the nodes being deleted from affected set
+    for (int node : node_indices) {
+        affected.erase(node);
+    }
+    
+    // Track which nodes to remove
+    std::unordered_set<int> to_remove(node_indices.begin(), node_indices.end());
+    
+    // Check if any removed nodes are high-level anchors
+    bool high_level_removal = false;
+    for (int node : node_indices) {
+        if (node >= 0 && node < graph_.num_nodes()) {
+            int layer = graph_.cells[node].layer;
+            if (layer >= 0 && layer <= 2) {  // Top 3 layers
+                high_level_removal = true;
+                std::cout << "  Warning: Removing high-level anchor (layer " << layer << ")" << std::endl;
+            }
+        }
+    }
+    
+    // Build new graph without removed nodes
+    std::vector<Cell> new_cells;
+    std::unordered_map<int, int> old_to_new;
+    
+    for (int i = 0; i < graph_.num_nodes(); ++i) {
+        if (to_remove.find(i) == to_remove.end()) {
+            int new_idx = static_cast<int>(new_cells.size());
+            old_to_new[i] = new_idx;
+            
+            Cell cell = graph_.cells[i];
+            cell.id = new_idx;
+            new_cells.push_back(cell);
+        }
+    }
+    
+    // Build new edges (skip edges involving removed nodes)
+    std::vector<Edge> new_edges;
+    for (const auto& edge : graph_.edges) {
+        if (to_remove.find(edge.from) == to_remove.end() &&
+            to_remove.find(edge.to) == to_remove.end()) {
+            Edge new_edge;
+            new_edge.from = old_to_new[edge.from];
+            new_edge.to = old_to_new[edge.to];
+            new_edge.weight = edge.weight;
+            new_edges.push_back(new_edge);
+        }
+    }
+    
+    // Replace graph
+    graph_.cells = new_cells;
+    graph_.edges = new_edges;
+    graph_.build_adjacency();
+    
+    // Update layers with new indices
+    for (auto& layer : layers_) {
+        std::vector<int> new_layer;
+        for (int node : layer) {
+            auto it = old_to_new.find(node);
+            if (it != old_to_new.end()) {
+                new_layer.push_back(it->second);
+            }
+        }
+        layer = new_layer;
+    }
+    
+    // Remap affected set to new indices
+    std::unordered_set<int> new_affected;
+    for (int node : affected) {
+        auto it = old_to_new.find(node);
+        if (it != old_to_new.end()) {
+            new_affected.insert(it->second);
+        }
+    }
+    
+    // If high-level anchor removed, do more extensive optimization
+    int iterations = high_level_removal ? config_.refinement_iterations : config_.refinement_iterations / 2;
+    
+    // Find boundary
+    std::unordered_set<int> boundary;
+    for (int node : new_affected) {
+        for (int neighbor : graph_.neighbors(node)) {
+            if (new_affected.find(neighbor) == new_affected.end()) {
+                boundary.insert(neighbor);
+            }
+        }
+    }
+    
+    local_optimize(new_affected, boundary, iterations);
+    
+    std::cout << "  Nodes remaining: " << graph_.num_nodes() << std::endl;
+    std::cout << "  HPWL after remove: " << get_hpwl() << std::endl;
+    
+    return old_to_new;
+}
+
+void HAnchorCore::incremental_add_edges(
+    const std::vector<int>& edge_from,
+    const std::vector<int>& edge_to,
+    const std::vector<double>& edge_weights
+) {
+    std::cout << "Incremental add edges: " << edge_from.size() << " edges" << std::endl;
+    
+    // Collect affected nodes
+    std::vector<int> affected_list;
+    for (size_t i = 0; i < edge_from.size(); ++i) {
+        int from = edge_from[i];
+        int to = edge_to[i];
+        double weight = (i < edge_weights.size()) ? edge_weights[i] : 1.0;
+        
+        if (from >= 0 && from < graph_.num_nodes() &&
+            to >= 0 && to < graph_.num_nodes()) {
+            graph_.add_edge(from, to, weight);
+            affected_list.push_back(from);
+            affected_list.push_back(to);
+        }
+    }
+    
+    // Rebuild adjacency
+    graph_.build_adjacency();
+    
+    // Optimize around affected nodes
+    auto affected = find_affected_region(affected_list, 1);
+    std::unordered_set<int> boundary;
+    for (int node : affected) {
+        for (int neighbor : graph_.neighbors(node)) {
+            if (affected.find(neighbor) == affected.end()) {
+                boundary.insert(neighbor);
+            }
+        }
+    }
+    
+    local_optimize(affected, boundary, config_.refinement_iterations / 3);
+    
+    std::cout << "  HPWL after add edges: " << get_hpwl() << std::endl;
+}
+
+void HAnchorCore::incremental_remove_edges(
+    const std::vector<int>& edge_from,
+    const std::vector<int>& edge_to
+) {
+    std::cout << "Incremental remove edges: " << edge_from.size() << " edges" << std::endl;
+    
+    // Create set of edges to remove
+    std::set<std::pair<int, int>> to_remove;
+    std::vector<int> affected_list;
+    
+    for (size_t i = 0; i < edge_from.size(); ++i) {
+        int from = edge_from[i];
+        int to = edge_to[i];
+        to_remove.insert({std::min(from, to), std::max(from, to)});
+        affected_list.push_back(from);
+        affected_list.push_back(to);
+    }
+    
+    // Filter edges
+    std::vector<Edge> new_edges;
+    for (const auto& edge : graph_.edges) {
+        auto key = std::make_pair(std::min(edge.from, edge.to), std::max(edge.from, edge.to));
+        if (to_remove.find(key) == to_remove.end()) {
+            new_edges.push_back(edge);
+        }
+    }
+    
+    graph_.edges = new_edges;
+    graph_.build_adjacency();
+    
+    // Optimize around affected nodes
+    auto affected = find_affected_region(affected_list, 1);
+    std::unordered_set<int> boundary;
+    for (int node : affected) {
+        for (int neighbor : graph_.neighbors(node)) {
+            if (affected.find(neighbor) == affected.end()) {
+                boundary.insert(neighbor);
+            }
+        }
+    }
+    
+    local_optimize(affected, boundary, config_.refinement_iterations / 3);
+    
+    std::cout << "  HPWL after remove edges: " << get_hpwl() << std::endl;
 }
 
 }  // namespace hanchor

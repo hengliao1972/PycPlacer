@@ -50,6 +50,35 @@ PYBIND11_MODULE(h_anchor_cpp, m) {
         .def("get_positions_y", &hanchor::HAnchorCore::get_positions_y)
         .def("get_layer_sizes", &hanchor::HAnchorCore::get_layer_sizes)
         .def("get_layers", &hanchor::HAnchorCore::get_layers)
-        .def("get_hpwl", &hanchor::HAnchorCore::get_hpwl);
+        .def("get_hpwl", &hanchor::HAnchorCore::get_hpwl)
+        .def("get_node_layer", &hanchor::HAnchorCore::get_node_layer,
+             py::arg("node_idx"))
+        // Incremental update API
+        .def("incremental_update_positions", &hanchor::HAnchorCore::incremental_update_positions,
+             py::arg("node_indices"),
+             py::arg("new_x"),
+             py::arg("new_y"),
+             py::arg("propagation_radius") = 2,
+             "Update positions of nodes and propagate changes locally")
+        .def("incremental_add_nodes", &hanchor::HAnchorCore::incremental_add_nodes,
+             py::arg("node_names"),
+             py::arg("node_widths"),
+             py::arg("node_heights"),
+             py::arg("edge_from"),
+             py::arg("edge_to"),
+             py::arg("edge_weights"),
+             "Add new nodes and edges incrementally")
+        .def("incremental_remove_nodes", &hanchor::HAnchorCore::incremental_remove_nodes,
+             py::arg("node_indices"),
+             "Remove nodes and return index mapping")
+        .def("incremental_add_edges", &hanchor::HAnchorCore::incremental_add_edges,
+             py::arg("edge_from"),
+             py::arg("edge_to"),
+             py::arg("edge_weights"),
+             "Add edges between existing nodes")
+        .def("incremental_remove_edges", &hanchor::HAnchorCore::incremental_remove_edges,
+             py::arg("edge_from"),
+             py::arg("edge_to"),
+             "Remove edges from the graph");
 }
 
