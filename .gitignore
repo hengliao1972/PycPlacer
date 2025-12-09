@@ -19,8 +19,8 @@ build/
 *.swp
 *.swo
 
-# Output images (can be regenerated)
-output/
+# Output images - keep for demonstration
+# output/
 
 # Benchmark data (downloaded separately)
 benchmarks_data/
