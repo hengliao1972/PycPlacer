@@ -475,6 +475,10 @@ class HAnchorPlacer:
                 node_indices, new_x, new_y, propagation_radius
             )
             self._sync_positions()
+            
+            # Re-apply boundary constraints for ports
+            if self.ports:
+                self._constrain_ports_to_boundary()
         
         return self.compute_wirelength()
     

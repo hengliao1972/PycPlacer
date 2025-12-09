@@ -822,6 +822,12 @@ void HAnchorCore::incremental_update_positions(
         int current = bfs_queue.front();
         bfs_queue.pop();
         
+        // Skip port nodes (they should maintain fixed boundary positions)
+        const std::string& cell_name = graph_.cells[current].name;
+        if (cell_name.find("__port__") == 0) {
+            continue;
+        }
+        
         int hop = node_hop[current];
         
         // Calculate weighted average displacement from neighbors that are closer to source
@@ -852,10 +858,11 @@ void HAnchorCore::incremental_update_positions(
         
         if (total_weight > 0) {
             // Decay factor: displacement decreases with hop distance
-            // decay = 1 / (1 + hop * decay_rate)
-            // This creates a gentle ripple effect
-            double decay_rate = 2.0;  // Higher = faster decay
-            double decay = 1.0 / (1.0 + hop * decay_rate);
+            // decay = 1 / (1 + hop * decay_rate)^2
+            // This creates a gentle ripple effect with quadratic decay
+            double decay_rate = 3.0;  // Higher = faster decay
+            double base_decay = 1.0 / (1.0 + hop * decay_rate);
+            double decay = base_decay * base_decay;  // Quadratic decay for smoother falloff
             
             double avg_dx = (total_dx / total_weight) * decay;
             double avg_dy = (total_dy / total_weight) * decay;

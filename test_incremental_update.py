@@ -17,7 +17,7 @@ import numpy as np
 import matplotlib
 matplotlib.use('Agg')  # Non-interactive backend for saving to files
 
-from h_anchor_fast import HAnchorPlacer, PlacementConfig
+from h_anchor_fast import HAnchorPlacer, PlacementConfig, Port, PortSide
 from benchmarks import generate_large_cpu_design, generate_clustered_netlist
 from visualization import plot_placement_comparison
 
@@ -44,20 +44,24 @@ def test_incremental_update_large_cpu():
     print(f"    Cells: {num_cells:,}")
     print(f"    Edges: {num_edges:,}")
     
-    # Configure placer
+    # Configure placer - 使用最佳参数配置
     config = PlacementConfig(
-        num_layers=8,
-        top_layer_size=30,
-        decimation_factor=0.4,
-        die_width=3000,
-        die_height=3000,
-        top_layer_iterations=300,
-        refinement_iterations=100,
-        repulsion_strength=3.0,
-        attraction_strength=0.03,
-        overlap_repulsion=5.0,
-        min_spacing=10.0,
-        center_gravity=0.02,
+        die_width=800,
+        die_height=800,
+        num_layers=6,
+        top_layer_size=50,
+        
+        spread_factor=0.95,
+        center_gravity=0.012,
+        global_attraction=0.008,
+        
+        repulsion_strength=6.0,
+        attraction_strength=0.04,
+        overlap_repulsion=8.0,
+        min_spacing=4.0,
+        
+        top_layer_iterations=350,
+        refinement_iterations=150,
     )
     
     # =========================================================================
@@ -66,6 +70,30 @@ def test_incremental_update_large_cpu():
     print("\n[2] Running original full placement...")
     placer = HAnchorPlacer(config)
     placer.load_netlist(graph, cells)
+    
+    # Add ports for a more realistic design
+    cell_names = list(cells.keys())
+    ctrl_cells = [c for c in cell_names if 'Control' in c][:3]
+    io_cells = [c for c in cell_names if 'IOCtrl' in c][:2]
+    mem_cells = [c for c in cell_names if 'MemCtrl' in c][:2]
+    alu_cells = [c for c in cell_names if 'ALU' in c][:2]
+    
+    ports = [
+        Port('clk', PortSide.LEFT, 0.5, ctrl_cells),
+        Port('reset_n', PortSide.LEFT, 0.3, ctrl_cells[:2]),
+        Port('data_out[0]', PortSide.RIGHT, 0.3, io_cells),
+        Port('data_out[1]', PortSide.RIGHT, 0.5, io_cells),
+        Port('data_in[0]', PortSide.BOTTOM, 0.3, mem_cells),
+        Port('data_in[1]', PortSide.BOTTOM, 0.5, mem_cells),
+        Port('busy', PortSide.TOP, 0.3, alu_cells),
+        Port('done', PortSide.TOP, 0.5, alu_cells),
+    ]
+    
+    for port in ports:
+        placer.add_port(port)
+    placer.reload_with_ports()
+    
+    print(f"    Added {len(ports)} ports")
     
     start_time = time.time()
     placer.run()
@@ -117,20 +145,20 @@ def test_incremental_update_large_cpu():
     
     # Create new positions for selected cells
     # Move them by a small amount - realistic scenario (e.g., manual adjustment)
-    # 移动范围设置为较小的值，模拟实际的微调场景
+    # 移动范围设置为较小的值，模拟实际的微调场景 (800x800 die)
     new_positions = {}
     for cell in cells_to_move:
         orig_pos = original_positions[cell]
-        # Move each cell by a small offset (50-100 units, ~3% of die size)
+        # Move each cell by a small offset (20-40 units, ~5% of die size)
         # 这模拟用户对某些单元做小范围调整的场景
         np.random.seed(hash(cell) % 2**32)
-        dx = np.random.uniform(-100, 100)  # 小范围移动
-        dy = np.random.uniform(-100, 100)
-        new_x = np.clip(orig_pos[0] + dx, 50, config.die_width - 50)
-        new_y = np.clip(orig_pos[1] + dy, 50, config.die_height - 50)
+        dx = np.random.uniform(-40, 40)  # 小范围移动
+        dy = np.random.uniform(-40, 40)
+        new_x = np.clip(orig_pos[0] + dx, 20, config.die_width - 20)
+        new_y = np.clip(orig_pos[1] + dy, 20, config.die_height - 20)
         new_positions[cell] = (new_x, new_y)
         dist = np.sqrt(dx**2 + dy**2)
-        print(f"    Moving {cell}: ({orig_pos[0]:.1f}, {orig_pos[1]:.1f}) → ({new_x:.1f}, {new_y:.1f}) [距离: {dist:.1f}]")
+        print(f"    Moving {cell}: ({orig_pos[0]:.1f}, {orig_pos[1]:.1f}) -> ({new_x:.1f}, {new_y:.1f}) [dist: {dist:.1f}]")
     
     # Run incremental update
     # propagation_radius: 传播半径，控制受影响的邻居范围
