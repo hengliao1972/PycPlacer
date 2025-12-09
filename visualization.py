@@ -77,6 +77,9 @@ MODULE_COLORS = [
     '#32CD32',  # Lime Green
 ]
 
+# Port color - distinct color for boundary port signals
+PORT_COLOR = '#FF4500'  # Orange-Red for ports
+
 
 class PlacementVisualizer:
     """Visualizer for H-Anchor placement results."""
@@ -315,11 +318,44 @@ class PlacementVisualizer:
                 label=f"Layer {layer_idx}" if layer_idx < 4 else None
             )
         
+        # Draw port cells on boundary (with distinct color and marker)
+        port_x, port_y = [], []
+        for name, cell in self.placer.cells.items():
+            if hasattr(cell, 'is_port') and cell.is_port and name in positions:
+                pos = positions[name]
+                if isinstance(pos, np.ndarray):
+                    port_x.append(pos[0])
+                    port_y.append(pos[1])
+                else:
+                    port_x.append(pos[0])
+                    port_y.append(pos[1])
+        
+        if port_x:
+            ax.scatter(
+                port_x, port_y,
+                c=PORT_COLOR,
+                s=120,
+                alpha=1.0,
+                marker='D',  # Diamond marker for ports
+                edgecolors='white',
+                linewidths=2,
+                zorder=100,
+                label='Ports'
+            )
+        
         ax.set_xlim(-50, config.die_width + 50)
         ax.set_ylim(-50, config.die_height + 50)
         ax.set_xlabel("X")
         ax.set_ylabel("Y")
-        ax.set_title(f"H-Anchor Placement ({len(positions):,} cells)", fontsize=14)
+        
+        # Count ports and regular cells
+        num_ports = len(port_x)
+        num_cells = len(positions) - num_ports
+        title = f"H-Anchor Placement ({num_cells:,} cells"
+        if num_ports > 0:
+            title += f", {num_ports} ports"
+        title += ")"
+        ax.set_title(title, fontsize=14)
         ax.legend(loc='upper right', facecolor=COLORS['background'], labelcolor=COLORS['text'])
         ax.set_aspect('equal')
         
@@ -1341,16 +1377,10 @@ def plot_placement_comparison(
                     dist = np.sqrt(dx**2 + dy**2)
                     
                     if dist > moved_threshold:
-                        # Draw arrow from original to new position
-                        ax.annotate('', xy=new, xytext=orig,
-                                   arrowprops=dict(
-                                       arrowstyle='->',
-                                       color=COLOR_ARROW,
-                                       alpha=0.7,
-                                       linewidth=1.5,
-                                       shrinkA=3,
-                                       shrinkB=3
-                                   ))
+                        # Draw line from original to new position
+                        ax.plot([orig[0], new[0]], [orig[1], new[1]],
+                               color=COLOR_ARROW, alpha=0.7, linewidth=1.5,
+                               zorder=50)
         
         ax.set_xlim(-50, die_width + 50)
         ax.set_ylim(-50, die_height + 50)
@@ -1465,8 +1495,7 @@ def plot_placement_comparison(
     ax_stats.text(0.25, stats_y, "Explicit", fontsize=8, color=COLORS['text'], va='center')
     
     stats_y -= 0.04
-    ax_stats.annotate('', xy=(0.25, stats_y), xytext=(0.05, stats_y),
-                     arrowprops=dict(arrowstyle='->', color=COLOR_ARROW, linewidth=1.5))
+    ax_stats.plot([0.05, 0.25], [stats_y, stats_y], color=COLOR_ARROW, linewidth=2)
     ax_stats.text(0.32, stats_y, "Move", fontsize=8, color=COLORS['text'], va='center')
     
     ax_stats.set_xlim(0, 1)

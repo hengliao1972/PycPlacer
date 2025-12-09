@@ -28,6 +28,15 @@ class ScoringMethod(Enum):
     BETWEENNESS = "betweenness"
 
 
+class PortSide(Enum):
+    """Side of the placement rectangle where a port is located."""
+    LEFT = "left"      # x = 0
+    RIGHT = "right"    # x = die_width
+    TOP = "top"        # y = die_height
+    BOTTOM = "bottom"  # y = 0
+    AUTO = "auto"      # Let algorithm decide
+
+
 @dataclass
 class PlacementConfig:
     """Configuration for H-Anchor placement."""
@@ -80,6 +89,29 @@ class Cell:
     y: float = 0.0
     legal_x: float = 0.0
     legal_y: float = 0.0
+    
+    # Port properties
+    is_port: bool = False
+    port_side: Optional[PortSide] = None  # Which side of rectangle (None = not a port)
+    port_position: Optional[float] = None  # Position along the side (0.0-1.0, None = auto)
+
+
+@dataclass
+class Port:
+    """
+    Represents a port signal on the boundary of the placement region.
+    
+    Ports are represented as dummy cells that must be placed on the 
+    boundary of the placement rectangle.
+    """
+    name: str
+    side: PortSide = PortSide.AUTO  # Which side (LEFT/RIGHT/TOP/BOTTOM/AUTO)
+    position: Optional[float] = None  # Position along side (0.0-1.0), None = auto
+    connected_cells: List[str] = field(default_factory=list)  # Internal cells connected to this port
+    
+    def __post_init__(self):
+        if self.connected_cells is None:
+            self.connected_cells = []
 
 
 class HAnchorPlacer:
@@ -91,6 +123,7 @@ class HAnchorPlacer:
         self.py_config = config or PlacementConfig()
         self.graph = None
         self.cells: Dict[str, Cell] = {}
+        self.ports: Dict[str, Port] = {}  # Port signals on boundary
         self.positions: Dict[str, np.ndarray] = {}
         self.legal_positions: Dict[str, Tuple[float, float]] = {}
         self.layers: List[List[str]] = []
@@ -171,6 +204,191 @@ class HAnchorPlacer:
             edge_weights
         )
     
+    def add_port(self, port: Port, edge_weight: float = 2.0) -> str:
+        """
+        Add a port signal to the placement.
+        
+        Creates a dummy cell for the port and connects it to internal cells.
+        The port will be constrained to the boundary of the placement rectangle.
+        
+        Note: Call this AFTER load_netlist(), then call reload_with_ports() to update.
+        
+        Args:
+            port: Port object defining the port signal
+            edge_weight: Weight for edges connecting port to internal cells
+            
+        Returns:
+            Name of the dummy cell created for this port
+        """
+        port_cell_name = f"__port__{port.name}"
+        
+        # Create dummy cell for port
+        port_cell = Cell(
+            id=port_cell_name,
+            width=1.0,
+            height=1.0,
+            is_port=True,
+            port_side=port.side,
+            port_position=port.position,
+            module="__PORT__"
+        )
+        
+        self.cells[port_cell_name] = port_cell
+        self.ports[port.name] = port
+        
+        # Add to graph if it exists
+        if self.graph is not None:
+            self.graph.add_node(port_cell_name)
+            for connected_cell in port.connected_cells:
+                if connected_cell in self.graph.nodes():
+                    self.graph.add_edge(port_cell_name, connected_cell, weight=edge_weight)
+        
+        return port_cell_name
+    
+    def add_ports(self, ports: List[Port], edge_weight: float = 2.0) -> List[str]:
+        """Add multiple ports at once."""
+        return [self.add_port(p, edge_weight) for p in ports]
+    
+    def reload_with_ports(self):
+        """
+        Reload the netlist with ports included.
+        
+        Call this after adding ports to update the C++ backend.
+        """
+        if self.graph is None:
+            return
+        
+        # Rebuild node mapping (now includes port cells)
+        self._node_names = list(self.graph.nodes())
+        self._node_to_idx = {name: i for i, name in enumerate(self._node_names)}
+        
+        # Convert to C++ format
+        node_widths = [self.cells[n].width if n in self.cells else 1.0 for n in self._node_names]
+        node_heights = [self.cells[n].height if n in self.cells else 1.0 for n in self._node_names]
+        
+        edge_from = []
+        edge_to = []
+        edge_weights = []
+        
+        for u, v, data in self.graph.edges(data=True):
+            edge_from.append(self._node_to_idx[u])
+            edge_to.append(self._node_to_idx[v])
+            edge_weights.append(data.get('weight', 1.0))
+        
+        # Reload C++ core
+        self._cpp_core = h_anchor_cpp.HAnchorCore(self._cpp_config)
+        self._cpp_core.load_graph(
+            self._node_names,
+            node_widths,
+            node_heights,
+            edge_from,
+            edge_to,
+            edge_weights
+        )
+    
+    def _compute_port_position(self, port_cell_name: str) -> Tuple[float, float]:
+        """
+        Compute the position for a port cell based on its constraints.
+        
+        For AUTO side ports, determines the best side based on connected cells.
+        """
+        cell = self.cells[port_cell_name]
+        config = self.py_config
+        
+        # Get connected cells' positions
+        connected_positions = []
+        if self.graph is not None:
+            for neighbor in self.graph.neighbors(port_cell_name):
+                if neighbor in self.positions:
+                    pos = self.positions[neighbor]
+                    if isinstance(pos, np.ndarray):
+                        connected_positions.append((pos[0], pos[1]))
+                    else:
+                        connected_positions.append(pos)
+        
+        # Default to center if no connections
+        if not connected_positions:
+            center_x = config.die_width / 2
+            center_y = config.die_height / 2
+            connected_positions = [(center_x, center_y)]
+        
+        # Compute centroid of connected cells
+        avg_x = np.mean([p[0] for p in connected_positions])
+        avg_y = np.mean([p[1] for p in connected_positions])
+        
+        side = cell.port_side
+        position = cell.port_position  # 0.0-1.0 along the side
+        
+        # Determine side if AUTO
+        if side == PortSide.AUTO or side is None:
+            # Choose side closest to centroid
+            distances = {
+                PortSide.LEFT: avg_x,
+                PortSide.RIGHT: config.die_width - avg_x,
+                PortSide.BOTTOM: avg_y,
+                PortSide.TOP: config.die_height - avg_y,
+            }
+            side = min(distances, key=distances.get)
+            cell.port_side = side
+        
+        # Compute position along the side
+        if position is None:
+            # Position based on projection of centroid onto the side
+            if side in (PortSide.LEFT, PortSide.RIGHT):
+                position = avg_y / config.die_height
+            else:
+                position = avg_x / config.die_width
+            position = np.clip(position, 0.05, 0.95)  # Keep away from corners
+        
+        # Convert to actual coordinates
+        if side == PortSide.LEFT:
+            return (0.0, position * config.die_height)
+        elif side == PortSide.RIGHT:
+            return (config.die_width, position * config.die_height)
+        elif side == PortSide.BOTTOM:
+            return (position * config.die_width, 0.0)
+        elif side == PortSide.TOP:
+            return (position * config.die_width, config.die_height)
+        else:
+            return (0.0, position * config.die_height)
+    
+    def _constrain_ports_to_boundary(self):
+        """Constrain all port cells to their designated boundary positions."""
+        for port_name, port in self.ports.items():
+            port_cell_name = f"__port__{port_name}"
+            if port_cell_name in self.cells:
+                x, y = self._compute_port_position(port_cell_name)
+                self.positions[port_cell_name] = np.array([x, y])
+                self.legal_positions[port_cell_name] = (x, y)
+                self.cells[port_cell_name].x = x
+                self.cells[port_cell_name].y = y
+    
+    def _clamp_positions_to_boundary(self):
+        """Ensure all non-port cells are within the placement rectangle."""
+        config = self.py_config
+        for name, pos in self.positions.items():
+            cell = self.cells.get(name)
+            if cell and cell.is_port:
+                continue  # Ports handled separately
+            
+            if isinstance(pos, np.ndarray):
+                x, y = pos[0], pos[1]
+            else:
+                x, y = pos
+            
+            # Clamp to boundary with margin for cell size
+            margin_x = cell.width / 2 if cell else 0.5
+            margin_y = cell.height / 2 if cell else 0.5
+            
+            x = np.clip(x, margin_x, config.die_width - margin_x)
+            y = np.clip(y, margin_y, config.die_height - margin_y)
+            
+            self.positions[name] = np.array([x, y])
+            self.legal_positions[name] = (x, y)
+            if cell:
+                cell.x = x
+                cell.y = y
+    
     def run(self) -> Dict[str, Tuple[float, float]]:
         """
         Run the complete H-Anchor placement flow.
@@ -201,6 +419,10 @@ class HAnchorPlacer:
         for layer_indices in cpp_layers:
             layer_names = [self._node_names[i] for i in layer_indices]
             self.layers.append(layer_names)
+        
+        # Apply boundary constraints
+        self._clamp_positions_to_boundary()  # All cells within rectangle
+        self._constrain_ports_to_boundary()  # Ports on boundary edges
         
         return self.legal_positions
     
